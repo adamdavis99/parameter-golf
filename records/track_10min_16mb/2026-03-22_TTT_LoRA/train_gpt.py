@@ -1030,6 +1030,14 @@ def eval_val_ttt_lora(
                 (per_doc * mask).sum().backward()
                 cur_opt.step()
 
+            # Free ptl (and its computation graph) immediately after all uses
+            del ptl
+            del x, y
+
+        # Explicitly free partial-batch LoRA to avoid GPU memory accumulation
+        if bsz != batch_size:
+            del cur_lora, cur_opt
+
         if rank == 0 and (bi // batch_size) % 20 == 0:
             done = min(bi + batch_size, len(rank_docs))
             pct = done / len(rank_docs) * 100
@@ -1167,10 +1175,13 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+    sm_major = torch.cuda.get_device_properties(device).major
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    # Fallback for GPUs without Flash Attention (sm < 8.0: V100, T4, P100)
+    # RTX 3090=sm86, A100=sm80 → flash only. T4=sm75 → mem_efficient+math fallbacks.
+    enable_mem_efficient_sdp(sm_major < 8)
+    enable_math_sdp(sm_major < 8)
 
     logfile = None
     if master_process:
@@ -1483,7 +1494,11 @@ def main() -> None:
     torch._dynamo.reset()
     import gc; gc.collect()
     torch.cuda.empty_cache()
-    log0(f"post-cleanup memory allocated: {torch.cuda.memory_allocated() // 1024 // 1024} MiB")
+    torch.cuda.reset_peak_memory_stats()
+    log0(
+        f"post-cleanup memory: allocated={torch.cuda.memory_allocated() // 1024 // 1024}MiB "
+        f"reserved={torch.cuda.memory_reserved() // 1024 // 1024}MiB"
+    )
 
     # Magnitude pruning: zero out smallest weights to improve compression
     with torch.no_grad():
@@ -1545,6 +1560,15 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(
+        f"post-sliding-eval memory: allocated={torch.cuda.memory_allocated() // 1024 // 1024}MiB "
+        f"peak={torch.cuda.max_memory_allocated() // 1024 // 1024}MiB"
+    )
+
+    # Free sliding-eval allocations before TTT eval (TTT needs more memory for backward passes)
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
 
     # TTT LoRA eval on the int6-roundtripped model
     if args.ttt_enabled:
@@ -1566,6 +1590,10 @@ def main() -> None:
             log0(f"final_ttt_lora_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
         else:
             log0("ttt_eval: no documents found (no BOS tokens in val data) — skipping TTT")
+        log0(
+            f"post-ttt-eval memory: allocated={torch.cuda.memory_allocated() // 1024 // 1024}MiB "
+            f"peak={torch.cuda.max_memory_allocated() // 1024 // 1024}MiB"
+        )
 
     if distributed:
         dist.destroy_process_group()
