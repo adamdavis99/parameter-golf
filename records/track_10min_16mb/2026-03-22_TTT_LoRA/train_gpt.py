@@ -1462,6 +1462,13 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
+    # Free training memory before eval (CUDA graphs, optimizer states, compile cache)
+    del model, compiled_model, optimizers, optimizer_tok, optimizer_muon, optimizer_scalar
+    torch._dynamo.reset()
+    import gc; gc.collect()
+    torch.cuda.empty_cache()
+    log0(f"post-cleanup memory allocated: {torch.cuda.memory_allocated() // 1024 // 1024} MiB")
+
     # Magnitude pruning: zero out smallest weights to improve compression
     with torch.no_grad():
         for name, param in base_model.named_parameters():
