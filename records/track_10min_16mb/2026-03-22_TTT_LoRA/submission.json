@@ -1,0 +1,13 @@
+{
+  "author": "aruneshsarker",
+  "description": "SOTA (10L Int5MLP MuonWD0.04 SWA50) + Test-Time Training with LoRA adapters (rank-8, lr=0.01, chunk=256)",
+  "base": "2026-03-20_10L_Int5MLP_MuonWD04_SWA50",
+  "changes": [
+    "Added TTT LoRA eval: per-document LoRA adaptation at eval time (no retraining needed)",
+    "BatchedLinearLoRA: batched per-document Q/V/lm_head LoRA adapters (rank=8)",
+    "eval_val_ttt_lora: chunk-based document eval with Adam TTT updates before each chunk",
+    "CausalSelfAttention.forward_ttt / Block.forward_ttt / GPT.forward_ttt: LoRA-augmented forward",
+    "TTT hyperparams: ttt_lora_rank=8, ttt_lora_lr=0.01, ttt_chunk_size=256, ttt_batch_size=64"
+  ],
+  "expected_improvement": "-0.010 to -0.020 BPB vs sliding-window-only baseline"
+}
