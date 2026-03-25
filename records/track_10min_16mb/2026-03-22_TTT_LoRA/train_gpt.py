@@ -58,7 +58,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 10))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -500,8 +500,12 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 class Rotary(nn.Module):
     def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        # Partial RoPE: apply only to first 25% of dimensions
+        rope_dim = int(dim * 0.25)
+        inv_freq = 1.0 / (base ** (torch.arange(0, rope_dim, 2, dtype=torch.float32) / rope_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.rope_dim = rope_dim
+        self.full_dim = dim
         self._seq_len_cached = 0
         self._cos_cached: Tensor | None = None
         self._sin_cached: Tensor | None = None
@@ -521,10 +525,20 @@ class Rotary(nn.Module):
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
-def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dim: int | None = None) -> Tensor:
+    # Partial RoPE: apply rotation only to first rope_dim dimensions
+    if rope_dim is None:
+        rope_dim = x.size(-1)
+
+    half = rope_dim // 2
+    x1, x2 = x[..., :half], x[..., half:rope_dim]
+    rotated = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+
+    # Concatenate unrotated dimensions if partial RoPE
+    if rope_dim < x.size(-1):
+        rotated = torch.cat([rotated, x[..., rope_dim:]], dim=-1)
+
+    return rotated
 
 
 class CausalSelfAttention(nn.Module):
@@ -556,8 +570,8 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        q = apply_rotary_emb(q, cos, sin, self.rotary.rope_dim)
+        k = apply_rotary_emb(k, cos, sin, self.rotary.rope_dim)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q, k, v, attn_mask=None, is_causal=True,
@@ -577,8 +591,8 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        q = apply_rotary_emb(q, cos, sin, self.rotary.rope_dim)
+        k = apply_rotary_emb(k, cos, sin, self.rotary.rope_dim)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q, k, v, attn_mask=None, is_causal=True,
@@ -597,7 +611,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), 0.5)
         return self.proj(x.square())
 
 
@@ -641,14 +655,16 @@ class BigramHashEmbedding(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float, layer_index: int = 0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        # LN Scale Damping: dampens residual stream in deeper layers as 1/√(layer_idx + 1)
+        ln_scale = 1.0 / math.sqrt(layer_index + 1.0)
+        self.attn_scale = nn.Parameter(torch.full((dim,), ln_scale, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.full((dim,), ln_scale, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
@@ -701,8 +717,8 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.blocks = nn.ModuleList(
             [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-                for _ in range(num_layers)
+                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_index=i)
+                for i in range(num_layers)
             ]
         )
         self.final_norm = RMSNorm()
